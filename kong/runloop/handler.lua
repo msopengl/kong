@@ -46,14 +46,17 @@ local exit         = ngx.exit
 local sleep        = ngx.sleep
 local header       = ngx.header
 local ngx_now      = ngx.now
-local timer_at     = ngx.timer.at
+local start_time   = ngx.req.start_time
+local clear_header = ngx.req.clear_header
+local update_time  = ngx.update_time
+local worker_id    = ngx.worker.id
 local re_match     = ngx.re.match
 local re_find      = ngx.re.find
 local re_split     = ngx_re.split
-local update_time  = ngx.update_time
+local timer_at     = ngx.timer.at
+local timer_every  = ngx.timer.every
+local get_phase    = ngx.get_phase
 local subsystem    = ngx.config.subsystem
-local start_time   = ngx.req.start_time
-local clear_header = ngx.req.clear_header
 local starttls     = ngx.req.starttls
 local kong_dict    = ngx.shared.kong
 local unpack       = unpack
@@ -162,14 +165,44 @@ local function load_declarative_config()
 end
 
 
+local function prewarm_hostname(premature, host)
+  if premature then
+    return
+  end
+
+  kong.dns.toip(host)
+end
+
+
+local function prewarm_hostnames(premature, hosts, count)
+  if premature then
+    return
+  end
+
+  log(DEBUG, "prewarming dns client on worker #", WORKER_ID, "...")
+  for i = 1, count do
+    prewarm_hostname(premature, hosts[i])
+  end
+  log(DEBUG, "prewarming dns client on worker #", WORKER_ID, " done")
+end
+
+
 local function cache_services()
   if not kong.db or not kong.cache then
     return true
   end
 
+  local hosts, names, count = {}, {}, 0
+
   for service, err in kong.db.services:each(1000) do
     if err then
       return nil, err
+    end
+
+    if utils.hostname_type(service.host) == "name" and names[service.host] == nil then
+      count = count + 1
+      hosts[count] = service.host
+      names[service.host] = true
     end
 
     local cache_key = kong.db.services:cache_key(service)
@@ -181,18 +214,22 @@ local function cache_services()
     end
   end
 
+  if count > 0 then
+    timer_at(0, prewarm_hostnames, hosts, count)
+  end
+
   return true
 end
 
 
 local function start_timers()
   -- initialize balancers for active healthchecks
-  ngx.timer.at(0, function()
+  timer_at(0, function()
     balancer.init()
   end)
 
 
-  ngx.timer.every(1, function(premature)
+  timer_every(1, function(premature)
     if premature then
       return
     end
@@ -253,7 +290,7 @@ local function register_events()
 
     local entity_channel           = data.schema.table or data.schema.name
     local entity_operation_channel = fmt("%s:%s", entity_channel,
-      data.operation)
+                                         data.operation)
 
     -- crud:routes
     local _, err = worker_events.post_local("crud", entity_channel, data)
@@ -282,7 +319,7 @@ local function register_events()
 
   worker_events.register(function(data)
     if data.operation ~= "create" and
-      data.operation ~= "delete"
+       data.operation ~= "delete"
     then
       -- no need to rebuild the router if we just added a Service
       -- since no Route is pointing to that Service yet.
@@ -290,6 +327,13 @@ local function register_events()
       -- only allowed because no Route is pointing to it anymore.
       log(DEBUG, "[events] Service updated, invalidating router")
       cache:invalidate("router:version")
+    end
+
+    if data.operation == "create" or
+       data.operation == "update" then
+      if utils.hostname_type(data.entity.host) == "name" then
+        timer_at(0, prewarm_hostname, data.entity.host)
+      end
     end
   end, "crud", "services")
 
@@ -317,8 +361,7 @@ local function register_events()
 
     for sn, err in db.snis:each_for_certificate({ id = certificate.id }, 1000) do
       if err then
-        log(ERR, "[events] could not find associated snis for certificate: ",
-          err)
+        log(ERR, "[events] could not find associated snis for certificate: ", err)
         break
       end
 
@@ -404,8 +447,7 @@ local function register_events()
       entity = data.entity,
     })
     if err then
-      log(ERR, "failed broadcasting upstream ",
-        operation, " to workers: ", err)
+      log(ERR, "failed broadcasting upstream ", operation, " to workers: ", err)
     end
     -- => to cluster_events handler
     local key = fmt("%s:%s:%s", operation, upstream.id, upstream.name)
@@ -454,7 +496,7 @@ end
 
 
 local function init_worker()
-  WORKER_ID = ngx.worker.id()
+  WORKER_ID = worker_id()
 
   local _, err = cache_services()
   if err then
@@ -619,8 +661,9 @@ do
   end
 
   build_router = function(version, recurse, tries)
+    local phase = get_phase()
     if version == "init" then
-      if ngx.get_phase() == "init" then
+      if phase == "init" then
         log(DEBUG, "initialising router...")
       else
         log(DEBUG, "initialising router on worker #", WORKER_ID, "...")
@@ -749,7 +792,7 @@ do
     singletons.router = new_router
 
     if version == "init" then
-      if ngx.get_phase() == "init" then
+      if phase == "init" then
         log(DEBUG, "initialising router done")
       else
         log(DEBUG, "initialising router on worker #", WORKER_ID, " done")
@@ -776,7 +819,7 @@ do
 
   build_plugins = function(version, recurse, tries)
     if version == "init" then
-      if ngx.get_phase() == "init" then
+      if get_phase() == "init" then
         log(DEBUG, "initialising plugins...")
       else
         log(DEBUG, "initialising plugins on worker #", WORKER_ID, "...")
@@ -853,7 +896,7 @@ do
     plugins = new_plugins
 
     if version == "init" then
-      if ngx.get_phase() == "init" then
+      if phase == "init" then
         log(DEBUG, "initialising plugins done")
       else
         log(DEBUG, "initialising plugins on worker #", WORKER_ID, " done")
@@ -900,7 +943,7 @@ do
   end
 
   local function rebuild_async(callback, version, semaphore)
-    local ok, err = ngx.timer.at(0, rebuild_timer, callback, version, semaphore)
+    local ok, err = timer_at(0, rebuild_timer, callback, version, semaphore)
     if not ok then
       log(CRIT, "could not create rebuild timer: ", err)
       return false
